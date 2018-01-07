@@ -6320,6 +6320,48 @@ err:
         return 0;
 }
 
+/* dht_readdirp_cbk creates a new dentry and dentry->inode is not assigned.
+   This functions assigns an inode if all of the following conditions are true:
+
+   * DHT has only one child. In this case the entire layout is present on this
+     single child and hence we can set complete layout in inode.
+   * backend has complete layout and there are no anomalies in it and from this
+    information layout can be constructed and set in inode.
+*/
+
+void
+dht_populate_inode_for_dentry (xlator_t *this, xlator_t *subvol,
+                               gf_dirent_t *entry, gf_dirent_t *orig_entry)
+{
+        dht_layout_t *layout = NULL;
+        int           ret    = 0;
+        loc_t         loc    = {0, };
+
+        layout = dht_layout_new (this, 1);
+        if (!layout)
+                goto out;
+
+        ret = dht_layout_merge (this, layout, subvol, 0, 0, orig_entry->dict);
+        if (!ret) {
+                gf_uuid_copy (loc.gfid, orig_entry->d_stat.ia_gfid);
+                loc.inode = inode_ref (orig_entry->inode);
+
+                ret = dht_layout_normalize (this, &loc, layout);
+                if (ret == 0) {
+                        dht_layout_set (this, orig_entry->inode, layout);
+                        entry->inode = inode_ref (orig_entry->inode);
+                        layout = NULL;
+                }
+
+                loc_wipe (&loc);
+        }
+
+        if (layout)
+                dht_layout_unref (this, layout);
+
+out:
+        return;
+}
 
 int
 dht_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
@@ -6329,7 +6371,6 @@ dht_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
         gf_dirent_t             *orig_entry = NULL;
         gf_dirent_t             *entry = NULL;
         xlator_t                *prev = NULL;
-        xlator_t                *next_subvol = NULL;
         off_t                    next_offset = 0;
         int                      count = 0;
         dht_layout_t            *layout = 0;
@@ -6341,17 +6382,47 @@ dht_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
         int                      readdir_optimize = 0;
         inode_table_t           *itable = NULL;
         inode_t                 *inode = NULL;
+        dht_readdir_state_t     *readdir_state = NULL;
+        dht_subvol_readdir_state_t *subvol_state = NULL, *rs_entry;
+        int                      is_complete = 1;
+        int                      is_last_call = 0;
+        int                      do_unwind = 0;
+        struct timeval           current = {0, };
 
         prev = cookie;
         local = frame->local;
         itable = local->fd ? local->fd->inode->table : NULL;
 
         conf  = this->private;
-        GF_VALIDATE_OR_GOTO(this->name, conf, unwind);
+        readdir_state = local->readdir_state;
+        GF_VALIDATE_OR_GOTO (this->name, conf, unwind);
+        GF_VALIDATE_OR_GOTO (this->name, readdir_state, unwind);
 
         methods = &(conf->methods);
 
-        local->op_errno = op_errno;
+        /* We need set the subvol_state a value. */
+        pthread_mutex_lock (&readdir_state->lock);
+        {
+                list_for_each_entry (rs_entry, &readdir_state->subvol_states,
+                                     list) {
+                        if (rs_entry->this == prev) {
+                                subvol_state = rs_entry;
+                                break;
+                        }
+                }
+
+                if (subvol_state == NULL) {
+                        gf_msg (this->name, GF_LOG_ERROR, -1,
+                                DHT_MSG_READDIR_ERROR,
+                                "Can not found the subvol %s.", prev->name);
+
+                        pthread_mutex_unlock (&readdir_state->lock);
+                        goto unwind;
+                }
+        }
+        pthread_mutex_unlock (&readdir_state->lock);
+
+        subvol_state->op_errno = op_errno;
 
         if (op_ret < 0)
                 goto done;
@@ -6388,23 +6459,22 @@ dht_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
 
                 if (check_is_dir (NULL, (&orig_entry->d_stat), NULL)) {
 
-                /*Directory entries filtering :
-                 * a) If rebalance is running, pick from first_up_subvol
-                 * b) (rebalance not running)hashed subvolume is NULL or
-                 * down then filter in first_up_subvolume. Other wise the
-                 * corresponding hashed subvolume will take care of the
-                 * directory entry.
-                 */
+                        /*Directory entries filtering :
+                         * a) If rebalance is running, pick from first_up_subvol
+                         * b) (rebalance not running)hashed subvolume is NULL or
+                         * down then filter in first_up_subvolume. Other wise the
+                         * corresponding hashed subvolume will take care of the
+                         * directory entry.
+                         */
                         if (readdir_optimize) {
                                 if (prev == local->first_up_subvol)
                                         goto list;
                                 else
                                         continue;
-
                         }
 
                         hashed_subvol = methods->layout_search (this, layout,
-                                                         orig_entry->d_name);
+                                                                orig_entry->d_name);
 
                         if (prev == hashed_subvol)
                                 goto list;
@@ -6458,6 +6528,12 @@ list:
                                 dht_inode_ctx_time_update (orig_entry->inode,
                                                            this, &entry->d_stat,
                                                            1);
+                                if (conf->subvolume_cnt == 1) {
+                                        dht_populate_inode_for_dentry (this,
+                                                                       prev,
+                                                                       entry,
+                                                                       orig_entry);
+                                }
                         }
                 } else {
                         if (orig_entry->inode) {
@@ -6482,9 +6558,8 @@ list:
                                 inode = inode_find (itable,
                                                     orig_entry->d_stat.ia_gfid);
                                 if (inode) {
-                                        ret = dht_layout_preset
-                                                            (this, prev,
-                                                             inode);
+                                        ret = dht_layout_preset (this, prev,
+                                                                 inode);
                                         if (ret)
                                                 gf_msg (this->name,
                                                      GF_LOG_WARNING, 0,
@@ -6497,56 +6572,63 @@ list:
                         }
                 }
 
-                list_add_tail (&entry->list, &local->entries.list);
-                local->filled += gf_dirent_size (entry->d_name);
+                list_add_tail (&entry->list, &subvol_state->entries.list);
+                subvol_state->filled += gf_dirent_size (entry->d_name);
+                subvol_state->op_ret++;
+
                 count++;
-                local->op_ret++;
         }
 
 done:
-        if ((op_ret == 0) && op_errno != ENOENT) {
-                /* remaining buffer size is not enough to hold even one
-                 * dentry
-                 */
+        gettimeofday (&current, NULL);
+        gf_msg (this->name, GF_LOG_TRACE, 0, DHT_MSG_READDIR_ERROR,
+                "readdir get %d items from xlator %s (volfile_id=%s), and"
+                " costs %ld seconds.",
+                count, prev->name, prev->volfile_id,
+                current.tv_sec - subvol_state->last_sent.tv_sec);
+
+        if ((count == 0) || (next_offset == 0) || (op_errno == ENOENT)) {
                 goto unwind;
         }
 
-        if ((count == 0) || (local && (local->filled < local->size))) {
-                if ((next_offset == 0) || (op_errno == ENOENT)) {
-                        next_offset = 0;
-                        next_subvol = dht_subvol_next (this, prev);
-                } else {
-                        next_subvol = prev;
-                }
-
-                if (!next_subvol) {
-                        goto unwind;
-                }
-
-                if (conf->readdir_optimize == _gf_true) {
-                        if (next_subvol != local->first_up_subvol) {
-                                ret = dict_set_int32 (local->xattr,
-                                                      GF_READDIR_SKIP_DIRS, 1);
-                                if (ret)
-                                        gf_msg (this->name, GF_LOG_ERROR, 0,
-                                                DHT_MSG_DICT_SET_FAILED,
-                                                "Failed to set dictionary value"
-                                                ":key = %s",
-                                                GF_READDIR_SKIP_DIRS );
-                        } else {
-                                 dict_del (local->xattr,
-                                           GF_READDIR_SKIP_DIRS);
-                        }
-                }
-
-                STACK_WIND_COOKIE (frame, dht_readdirp_cbk, next_subvol,
-                                   next_subvol, next_subvol->fops->readdirp,
-                                   local->fd, (local->size - local->filled),
+        if ((op_ret == 0) && op_errno != ENOENT) {
+                STACK_WIND_COOKIE (frame, dht_readdirp_cbk, prev,
+                                   prev, prev->fops->readdirp,
+                                   local->fd, subvol_state->size,
                                    next_offset, local->xattr);
+
+                /* remaining buffer size is not enough to hold even one
+                 * dentry
+                 */
+        }
+        else {
+                /* continute to do readdir */
+                STACK_WIND_COOKIE (frame, dht_readdirp_cbk, prev,
+                                   prev, prev->fops->readdirp,
+                                   local->fd, subvol_state->size,
+                                   next_offset, local->xattr);
+        }
+
+        return 0;
+
+unwind:
+        if (subvol_state)
+                subvol_state->is_complete = _gf_true;
+        else {
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        DHT_MSG_READDIR_ERROR,
+                        "Failed to find which subvolume is called");
+
+                op_errno = (op_errno == -1) ? errno : op_errno;
+
+                DHT_STACK_UNWIND (readdir, local->main_frame, -1, op_errno,
+                                  NULL, NULL);
+
+                DHT_STACK_DESTROY (frame);
+
                 return 0;
         }
 
-unwind:
         /* We need to ensure that only the last subvolume's end-of-directory
          * notification is respected so that directory reading does not stop
          * before all subvolumes have been read. That could happen because the
@@ -6554,16 +6636,59 @@ unwind:
          * distribute we're not concerned only with a posix's view of the
          * directory but the aggregated namespace' view of the directory.
          */
-        if ((local->op_ret >= 0) && (prev != dht_last_up_subvol (this)))
-                local->op_errno = 0;
+        if ((subvol_state->op_ret >= 0) && (prev != dht_last_up_subvol (this)))
+                subvol_state->op_errno = 0;
 
+        pthread_mutex_lock (&readdir_state->lock);
+        {
+                list_for_each_entry (rs_entry, &readdir_state->subvol_states, list) {
+                        if (!rs_entry->is_complete) {
+                                is_complete = 0;
+                                break;
+                        }
 
-        DHT_STACK_UNWIND (readdirp, frame, local->op_ret, local->op_errno,
-                          &local->entries, NULL);
+                        if (rs_entry->is_last_call) {
+                                is_last_call = 1;
+                        }
+                }
+
+                if (is_complete && is_last_call) {
+                        list_for_each_entry (rs_entry,
+                                             &readdir_state->subvol_states,
+                                             list) {
+                                // remove duplicate
+                                list_append_init (&rs_entry->entries.list,
+                                                  &local->entries.list);
+                                local->filled += rs_entry->filled;
+                                local->op_ret += rs_entry->op_ret;
+                        }
+
+                        if (!readdir_state->do_unwind) {
+                                do_unwind = 1;
+                                readdir_state->do_unwind = _gf_true;
+                        }
+
+                        local->op_errno = 0;
+                }
+        }
+        pthread_mutex_unlock (&readdir_state->lock);
+
+        gettimeofday (&current, NULL);
+        gf_msg (this->name, GF_LOG_TRACE, 0, DHT_MSG_READDIR_ERROR,
+                "readdir in the xlator (name = %s, volfile_id=%s)"
+                " total costs %ld seconds.",
+                prev->name, prev->volfile_id,
+                current.tv_sec - subvol_state->last_sent.tv_sec);
+
+        if (do_unwind) {
+                DHT_STACK_UNWIND (readdir, local->main_frame, local->op_ret,
+                                  local->op_errno, &local->entries, NULL);
+
+                DHT_STACK_DESTROY (frame);
+        }
 
         return 0;
 }
-
 
 int
 dht_readdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
@@ -6574,23 +6699,51 @@ dht_readdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         gf_dirent_t  *orig_entry = NULL;
         gf_dirent_t  *entry = NULL;
         xlator_t     *prev = NULL;
-        xlator_t     *next_subvol = NULL;
         off_t         next_offset = 0;
         int           count = 0;
         dht_layout_t *layout = 0;
         xlator_t     *subvol = 0;
         dht_conf_t   *conf = NULL;
         dht_methods_t *methods = NULL;
+        dht_readdir_state_t *readdir_state = NULL;
+        dht_subvol_readdir_state_t *subvol_state = NULL, *rs_entry;
+        int           is_complete = 1;
+        int           is_last_call = 0;
+        int           do_unwind = 0;
+        struct timeval current = {0, };
 
         prev = cookie;
         local = frame->local;
 
         conf = this->private;
+        readdir_state = local->readdir_state;
         GF_VALIDATE_OR_GOTO (this->name, conf, done);
+        GF_VALIDATE_OR_GOTO (this->name, readdir_state, done);
 
         methods = &(conf->methods);
 
-        local->op_errno = op_errno;
+        pthread_mutex_lock (&readdir_state->lock);
+        {
+                list_for_each_entry (rs_entry, &readdir_state->subvol_states,
+                                     list) {
+                        if (rs_entry->this == prev) {
+                                subvol_state = rs_entry;
+                                break;
+                        }
+                }
+
+                if (subvol_state == NULL) {
+                        gf_msg (this->name, GF_LOG_ERROR, -1,
+                                DHT_MSG_READDIR_ERROR,
+                                "Can not found the subvol %s.", prev->name);
+
+                        pthread_mutex_unlock (&readdir_state->lock);
+                        goto unwind;
+                }
+        }
+        pthread_mutex_unlock (&readdir_state->lock);
+
+        subvol_state->op_errno = op_errno;
 
         if (op_ret < 0) {
                 goto done;
@@ -6624,40 +6777,64 @@ dht_readdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                         entry->d_type = orig_entry->d_type;
                         entry->d_len  = orig_entry->d_len;
 
-                        list_add_tail (&entry->list, &local->entries.list);
+                        list_add_tail (&entry->list,
+                                       &subvol_state->entries.list);
+                        subvol_state->filled += gf_dirent_size (entry->d_name);
+                        subvol_state->op_ret++;
+
                         count++;
-                        local->filled += gf_dirent_size (entry->d_name);
-                        local->op_ret++;
                 }
         }
 
 done:
-        if ((op_ret == 0) && op_errno != ENOENT) {
-                /* remaining buffer size is not enough to hold even one
-                 * dentry
-                 */
+        gettimeofday (&current, NULL);
+        gf_msg (this->name, GF_LOG_TRACE, 0, DHT_MSG_READDIR_ERROR,
+                "readdir get %d items from xlator %s (volfile_id=%s), and"
+                " costs %ld seconds.",
+                count, prev->name, prev->volfile_id,
+                current.tv_sec - subvol_state->last_sent.tv_sec);
+
+        if ((op_ret <= 0) || (op_errno == ENOENT)) {
                 goto unwind;
         }
 
-        if ((count == 0) || (local && (local->filled < local->size))) {
-                if ((op_ret <= 0) || (op_errno == ENOENT)) {
-                        next_subvol = dht_subvol_next (this, prev);
-                } else {
-                        next_subvol = prev;
-                }
-
-                if (!next_subvol) {
-                        goto unwind;
-                }
-
-                STACK_WIND_COOKIE (frame, dht_readdir_cbk, next_subvol,
-                                   next_subvol, next_subvol->fops->readdir,
-                                   local->fd, (local->size - local->filled),
+        if (((count == 0) || (op_ret == 0)) && op_errno != ENOENT) {
+                STACK_WIND_COOKIE (frame, dht_readdir_cbk, prev,
+                                   prev, prev->fops->readdir,
+                                   local->fd, subvol_state->size,
                                    next_offset, NULL);
+                /* remaining buffer size is not enough to hold even one
+                 * dentry
+                 */
+        } else {
+                /* continute readdir */
+
+                STACK_WIND_COOKIE (frame, dht_readdir_cbk, prev,
+                                   prev, prev->fops->readdir,
+                                   local->fd, subvol_state->size,
+                                   next_offset, NULL);
+        }
+
+        return 0;
+
+unwind:
+        if (subvol_state)
+                subvol_state->is_complete = _gf_true;
+        else {
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        DHT_MSG_READDIR_ERROR,
+                        "Failed to find which subvolume is called");
+
+                op_errno = (op_errno == -1) ? errno : op_errno;
+
+                DHT_STACK_UNWIND (readdir, local->main_frame, -1,
+                                  op_errno, NULL, NULL);
+
+                DHT_STACK_DESTROY (frame);
+
                 return 0;
         }
 
-unwind:
         /* We need to ensure that only the last subvolume's end-of-directory
          * notification is respected so that directory reading does not stop
          * before all subvolumes have been read. That could happen because the
@@ -6665,16 +6842,208 @@ unwind:
          * distribute we're not concerned only with a posix's view of the
          * directory but the aggregated namespace' view of the directory.
          */
-        if ((local->op_ret >= 0) && (prev != dht_last_up_subvol (this)))
-                local->op_errno = 0;
+        if ((subvol_state->op_ret >= 0) && (prev != dht_last_up_subvol (this)))
+                subvol_state->op_errno = 0;
 
+        pthread_mutex_lock (&readdir_state->lock);
+        {
+                list_for_each_entry (rs_entry, &readdir_state->subvol_states,
+                                     list) {
+                        if (!rs_entry->is_complete) {
+                                is_complete = 0;
+                                break;
+                        }
 
-        DHT_STACK_UNWIND (readdir, frame, local->op_ret, local->op_errno,
-                          &local->entries, NULL);
+                        if (rs_entry->is_last_call) {
+                                is_last_call = 1;
+                        }
+                }
+
+                if (is_complete && is_last_call) {
+                        list_for_each_entry (rs_entry,
+                                             &readdir_state->subvol_states,
+                                             list) {
+                                // remove duplicate?
+                                list_append_init (&rs_entry->entries.list,
+                                                  &local->entries.list);
+                                local->filled += rs_entry->filled;
+                                local->op_ret += rs_entry->op_ret;
+                        }
+
+                        if (!readdir_state->do_unwind) {
+                                do_unwind = 1;
+                                readdir_state->do_unwind = _gf_true;
+                        }
+
+                        local->op_errno = 0;
+                }
+        }
+        pthread_mutex_unlock (&readdir_state->lock);
+
+        gettimeofday (&current, NULL);
+        gf_msg (this->name, GF_LOG_TRACE, 0, DHT_MSG_READDIR_ERROR,
+                "readdir in the xlator (name = %s, volfile_id=%s)"
+                " total costs %ld seconds.",
+                prev->name, prev->volfile_id,
+                current.tv_sec - subvol_state->last_sent.tv_sec);
+
+        if (do_unwind) {
+                DHT_STACK_UNWIND (readdir, local->main_frame, local->op_ret,
+                                  local->op_errno, &local->entries, NULL);
+
+                DHT_STACK_DESTROY (frame);
+        }
 
         return 0;
 }
 
+int
+dht_do_simultaneously_readdir (call_frame_t *frame, xlator_t *this, off_t yoff)
+{
+        int           op_errno = -1;
+        dht_local_t  *local = NULL;
+        xlator_t     *next_subvol = NULL, *cur_subvol = NULL;
+        dht_conf_t   *conf = NULL;
+        dht_readdir_state_t *readdir_state = NULL;
+        dht_subvol_readdir_state_t *subvol_rstate = NULL;
+        fd_t         *fd = NULL;
+        size_t        size;
+        dict_t       *dict = NULL;
+        call_frame_t *new_frame = NULL;
+        int           call_cnt = 0;
+        int           ret = 0;
+
+        conf = this->private;
+        local = frame->local;
+        fd = local->fd;
+        size = local->size;
+        dict = local->xattr;
+        readdir_state = local->readdir_state;
+        local->main_frame  = frame;
+        frame->local = NULL;
+
+        dht_deitransform (this, yoff, &next_subvol);
+
+        while (next_subvol != NULL) {
+                cur_subvol = next_subvol;
+                next_subvol = dht_subvol_next (this, cur_subvol);
+
+                subvol_rstate = GF_CALLOC (1, sizeof (dht_subvol_readdir_state_t),
+                                           gf_dht_subvol_readdir_state_t);
+                if (!subvol_rstate) {
+                        gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                DHT_MSG_READDIR_ERROR,
+                                "Memory allocation failed");
+
+                        op_errno = ENOMEM;
+                        goto err;
+                }
+
+                INIT_LIST_HEAD (&subvol_rstate->list);
+                subvol_rstate->this = cur_subvol;
+                INIT_LIST_HEAD (&subvol_rstate->entries.list);
+                subvol_rstate->filled = 0;
+                subvol_rstate->size = size;
+                subvol_rstate->offset = yoff;
+                subvol_rstate->is_complete = _gf_false;
+
+                if (next_subvol == NULL)
+                        subvol_rstate->is_last_call = _gf_true;
+                else
+                        subvol_rstate->is_last_call = _gf_false;
+
+                gettimeofday (&subvol_rstate->last_sent, NULL);
+
+                pthread_mutex_lock (&readdir_state->lock);
+                {
+                        list_add_tail (&subvol_rstate->list,
+                                       &readdir_state->subvol_states);
+                }
+                pthread_mutex_unlock (&readdir_state->lock);
+
+                if (local->fop == GF_FOP_READDIRP) {
+                        if (dict)
+                                local->xattr = dict_ref (dict);
+                        else
+                                local->xattr = dict_new ();
+
+                        if (local->xattr) {
+                                ret = dict_set_uint32 (local->xattr,
+                                                       conf->link_xattr_name, 256);
+                                if (ret)
+                                        gf_msg (this->name, GF_LOG_WARNING, 0,
+                                                DHT_MSG_DICT_SET_FAILED,
+                                                "Failed to set dictionary value"
+                                                " : key = %s",
+                                                conf->link_xattr_name);
+
+                                if (conf->readdir_optimize == _gf_true) {
+                                        if (cur_subvol != local->first_up_subvol) {
+                                                ret = dict_set_int32 (local->xattr,
+                                                               GF_READDIR_SKIP_DIRS, 1);
+                                                if (ret)
+                                                        gf_msg (this->name,
+                                                                GF_LOG_ERROR, 0,
+                                                                DHT_MSG_DICT_SET_FAILED,
+                                                                "Failed to set "
+                                                                "dictionary value: "
+                                                                "key = %s",
+                                                                GF_READDIR_SKIP_DIRS);
+                                        } else {
+                                                dict_del (local->xattr,
+                                                          GF_READDIR_SKIP_DIRS);
+                                        }
+                                }
+                        }
+
+                        new_frame = copy_frame (frame);
+
+                        if (!new_frame) {
+                                gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                        DHT_MSG_READDIR_ERROR,
+                                        "Memory allocation failed");
+                                op_errno = ENOMEM;
+                                goto err;
+                        }
+
+                        new_frame->local = local;
+
+                        STACK_WIND_COOKIE (new_frame, dht_readdirp_cbk, cur_subvol,
+                                           cur_subvol, cur_subvol->fops->readdirp,
+                                           local->fd, local->size,
+                                           yoff, local->xattr);
+                } else {
+                        new_frame = copy_frame (frame);
+                        if (!new_frame) {
+                                gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                        DHT_MSG_READDIR_ERROR,
+                                        "Memory allocation failed");
+                                op_errno = ENOMEM;
+                                goto err;
+                        }
+                        new_frame->local = local;
+
+                        STACK_WIND_COOKIE (new_frame, dht_readdir_cbk, cur_subvol,
+                                           cur_subvol, cur_subvol->fops->readdir,
+                                           local->fd, local->size,
+                                           yoff, local->xattr);
+                }
+
+                call_cnt++;
+        }
+
+        local->call_cnt = call_cnt;
+
+        return 0;
+
+err:
+        frame->local = local;
+
+        op_errno = (op_errno == -1) ? errno : op_errno;
+        DHT_STACK_UNWIND (readdir, frame, -1, op_errno, NULL, NULL);
+
+        return 0;
+}
 
 int
 dht_do_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
@@ -6682,9 +7051,8 @@ dht_do_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 {
         dht_local_t  *local  = NULL;
         int           op_errno = -1;
-        xlator_t     *xvol = NULL;
-        int           ret = 0;
         dht_conf_t   *conf = NULL;
+        dht_readdir_state_t *readdir_state = NULL;
 
         VALIDATE_OR_GOTO (frame, err);
         VALIDATE_OR_GOTO (this, err);
@@ -6699,58 +7067,28 @@ dht_do_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
                 goto err;
         }
 
+        readdir_state = GF_CALLOC (1, sizeof (dht_readdir_state_t),
+                                   gf_dht_readdir_state_t);
+        if (!readdir_state) {
+                gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                        DHT_MSG_READDIR_ERROR,
+                        "Memory allocation failed");
+
+                op_errno = ENOMEM;
+                goto err;
+        }
+        INIT_LIST_HEAD (&readdir_state->subvol_states);
+        readdir_state->do_unwind = _gf_false;
+        pthread_mutex_init (&readdir_state->lock, NULL);
+
+        local->readdir_state = readdir_state;
         local->fd = fd_ref (fd);
         local->size = size;
         local->xattr_req = (dict)? dict_ref (dict) : NULL;
         local->first_up_subvol = dht_first_up_subvol (this);
         local->op_ret = -1;
 
-        dht_deitransform (this, yoff, &xvol);
-
-        /* TODO: do proper readdir */
-        if (whichop == GF_FOP_READDIRP) {
-                if (dict)
-                        local->xattr = dict_ref (dict);
-                else
-                        local->xattr = dict_new ();
-
-                if (local->xattr) {
-                        ret = dict_set_uint32 (local->xattr,
-                                               conf->link_xattr_name, 256);
-                        if (ret)
-                                gf_msg (this->name, GF_LOG_WARNING, 0,
-                                        DHT_MSG_DICT_SET_FAILED,
-                                        "Failed to set dictionary value"
-                                        " : key = %s",
-                                        conf->link_xattr_name);
-
-                        if (conf->readdir_optimize == _gf_true) {
-                                if (xvol != local->first_up_subvol) {
-                                        ret = dict_set_int32 (local->xattr,
-                                                       GF_READDIR_SKIP_DIRS, 1);
-                                        if (ret)
-                                                gf_msg (this->name,
-                                                        GF_LOG_ERROR, 0,
-                                                        DHT_MSG_DICT_SET_FAILED,
-                                                        "Failed to set "
-                                                        "dictionary value: "
-                                                        "key = %s",
-                                                        GF_READDIR_SKIP_DIRS);
-                                } else {
-                                        dict_del (local->xattr,
-                                                  GF_READDIR_SKIP_DIRS);
-                                }
-                        }
-                }
-
-                STACK_WIND_COOKIE (frame, dht_readdirp_cbk, xvol, xvol,
-                                   xvol->fops->readdirp, fd, size, yoff,
-                                   local->xattr);
-        } else {
-                STACK_WIND_COOKIE (frame, dht_readdir_cbk, xvol, xvol,
-                                   xvol->fops->readdir, fd, size, yoff,
-                                   local->xattr);
-        }
+        dht_do_simultaneously_readdir (frame, this, yoff);
 
         return 0;
 
@@ -6760,7 +7098,6 @@ err:
 
         return 0;
 }
-
 
 int
 dht_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,

@@ -40,6 +40,8 @@ enum gf_dht_mem_types_ {
         gf_tier_mt_qfile_array_t,
         gf_dht_ret_cache_t,
         gf_dht_nodeuuids_t,
+        gf_dht_readdir_state_t,
+        gf_dht_subvol_readdir_state_t,
         gf_dht_mt_end
 };
 #endif

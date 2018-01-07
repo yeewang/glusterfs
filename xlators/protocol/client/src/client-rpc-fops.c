@@ -5557,7 +5557,7 @@ client3_3_readdir (call_frame_t *frame, xlator_t *this,
                 /* TODO: what is the size we should send ? */
                 /* This iobuf will live for only receiving the response,
                    so not harmful */
-                rsp_iobuf = iobuf_get (this->ctx->iobuf_pool);
+                rsp_iobuf = iobuf_get2 (this->ctx->iobuf_pool, 256 * GF_UNIT_KB);
                 if (rsp_iobuf == NULL) {
                         goto unwind;
                 }
@@ -5664,7 +5664,7 @@ client3_3_readdirp (call_frame_t *frame, xlator_t *this,
                 /* TODO: what is the size we should send ? */
                 /* This iobuf will live for only receiving the response,
                    so not harmful */
-                rsp_iobuf = iobuf_get (this->ctx->iobuf_pool);
+                rsp_iobuf = iobuf_get2 (this->ctx->iobuf_pool, 256 * GF_UNIT_KB);
                 if (rsp_iobuf == NULL) {
                         goto unwind;
                 }
@@ -5683,6 +5683,7 @@ client3_3_readdirp (call_frame_t *frame, xlator_t *this,
 
         local->fd = fd_ref (args->fd);
 
+        // submit readdir
         ret = client_submit_request (this, &req, frame, conf->fops,
                                      GFS3_OP_READDIRP,
                                      client3_3_readdirp_cbk, NULL,

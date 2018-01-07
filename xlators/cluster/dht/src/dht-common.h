@@ -253,6 +253,29 @@ typedef struct {
         uint64_t                 hashed_fsid;
 } tier_statvfs_t;
 
+struct dht_subvol_readdir_state {
+        struct list_head         list;
+        xlator_t                *this;
+        gf_dirent_t              entries;
+        size_t                   filled;
+        size_t                   size;
+        off_t                    offset;
+        int                      op_errno;
+        int                      op_ret;
+        gf_boolean_t             is_complete;
+        gf_boolean_t             is_last_call;
+
+        struct timeval           last_sent;
+};
+typedef struct dht_subvol_readdir_state dht_subvol_readdir_state_t;
+
+struct dht_readdir_state {
+        struct list_head         subvol_states;
+        gf_boolean_t             do_unwind;
+        pthread_mutex_t          lock;
+};
+typedef struct dht_readdir_state dht_readdir_state_t;
+
 struct dht_local {
         int                      call_cnt;
         loc_t                    loc;
@@ -365,6 +388,7 @@ struct dht_local {
         /* To hold dentries of readdir spawning across subvols */
         gf_dirent_t   entries;
         size_t        filled;
+        dht_readdir_state_t *readdir_state;
 
         /* rename rollback */
         int    *ret_cache ;

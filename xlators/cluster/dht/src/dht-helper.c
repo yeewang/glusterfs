@@ -728,6 +728,7 @@ dht_deitransform (xlator_t *this, uint64_t y, xlator_t **subvol_p)
 void
 dht_local_wipe (xlator_t *this, dht_local_t *local)
 {
+        dht_subvol_readdir_state_t *rd_entry, *rd_tmp;
         int i = 0;
 
         if (!local)
@@ -819,6 +820,19 @@ dht_local_wipe (xlator_t *this, dht_local_t *local)
 
         gf_dirent_free (&local->entries);
 
+        if (local->readdir_state) {
+                if (!list_empty (&local->readdir_state->subvol_states)) {
+                        list_for_each_entry_safe (rd_entry, rd_tmp,
+                                                  &local->readdir_state->subvol_states,
+                                                  list) {
+                                list_del (&rd_entry->list);
+                                gf_dirent_free (&rd_entry->entries);
+                                GF_FREE (rd_entry);
+                        }
+                }
+                GF_FREE (local->readdir_state);
+        }
+
         mem_put (local);
 }
 
@@ -859,6 +873,8 @@ dht_local_init (call_frame_t *frame, loc_t *loc, fd_t *fd, glusterfs_fop_t fop)
         }
 
         INIT_LIST_HEAD (&local->entries.list);
+        local->readdir_state = NULL;
+
         frame->local = local;
 
 out:
